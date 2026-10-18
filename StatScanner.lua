@@ -128,7 +128,8 @@ local function _ScanForMiscGearBonuses(line)
 	line = string.gsub( line, "^%s+", "" );
 	found = false;
 	for i,p in pairs(STATCOMPARE_OTHER_PATTERNS) do
-		start, _, value = string.find(line, "^" .. p.pattern);
+		if (not p.apattern) then p.apattern = "^" .. p.pattern; end
+		start, _, value = string.find(line, p.apattern);
 
 		if(start) then
 			if(p.value) then
@@ -151,7 +152,8 @@ local function _ScanForPassiveGearBonuses(line)
 	found = false;
 	line = string.gsub( line, "^%s+", "" );
 	for i,p in pairs(STATCOMPARE_EQUIP_PATTERNS) do
-		start, _, value = string.find(line, "^" .. p.pattern);
+		if (not p.apattern) then p.apattern = "^" .. p.pattern; end
+		start, _, value = string.find(line, p.apattern);
 		if(start) then
 			if(p.value) then
 				_SaveValueToBonuses(p.effect, p.value);
@@ -269,25 +271,35 @@ function StatScanner_ScanSetProperty(line)
 	return found;
 end
 
+local SC_AttackSpellId = nil;
 function StatCompare_CharStats_GetCritChance()
-	local critChance, iCritInfo, critNum;
-	local id = 1;
-	
-	-- This may vary depending on WoW localizations.
-	
-	local attackSpell = GetSpellName(id,BOOKTYPE_SPELL);
-	if (attackSpell ~= STATCOMPARE_ATTACKNAME) then
-		name, texture, offset, numSpells = GetSpellTabInfo(1);
-		for i=1, numSpells do
-			if (GetSpellName(i,BOOKTYPE_SPELL) == STATCOMPARE_ATTACKNAME) then
-				id = i;
+	local critChance, iCritInfo;
+	-- PERF: find the "Attack" spell once, then reuse its id (spellbook can change
+	-- when learning spells, so verify the name and rescan only if it moved).
+	local id = SC_AttackSpellId;
+	if (not id or GetSpellName(id, BOOKTYPE_SPELL) ~= STATCOMPARE_ATTACKNAME) then
+		id = 1;
+		if (GetSpellName(1, BOOKTYPE_SPELL) ~= STATCOMPARE_ATTACKNAME) then
+			local _, _, offset, numSpells = GetSpellTabInfo(1);
+			for i=1, numSpells do
+				if (GetSpellName(i,BOOKTYPE_SPELL) == STATCOMPARE_ATTACKNAME) then
+					id = i;
+					break;
+				end
 			end
 		end
+		SC_AttackSpellId = id;
 	end
-	GameTooltip:SetOwner(WorldFrame,"ANCHOR_NONE");
-	GameTooltip:SetSpell(id, BOOKTYPE_SPELL);
-	local spellName = GameTooltipTextLeft2:GetText();
-	GameTooltip:Hide();
+	-- PERF: use our private tooltip instead of GameTooltip, so other addons'
+	-- GameTooltip hooks (pfUI, EnhTooltip, ...) don't run on every refresh.
+	SCObjectTooltip:SetOwner(UIParent, "ANCHOR_NONE");
+	SCObjectTooltip:ClearLines();
+	SCObjectTooltip:SetSpell(id, BOOKTYPE_SPELL);
+	local spellName = SCObjectTooltipTextLeft2:GetText();
+	SCObjectTooltip:Hide();
+	if (not spellName) then
+		return nil;
+	end
 	iCritInfo = string.gsub(spellName, "(.*)%%.*", "%1");
 	if(iCritInfo) then
 		critChance = iCritInfo;
@@ -326,6 +338,27 @@ function StatScanner_ScanItem(link)
 	end
 end
 
+-- PERF: gear scan cache. Scanning 19 items through a tooltip + ~80 patterns per line
+-- is the expensive part of opening the character sheet. The result only depends on
+-- the equipped item links, so we keep the last result per unit and reuse it
+-- as long as the gear signature has not changed.
+StatScanner_GearCache = {};
+
+function StatScanner_GetGearSignature(unit)
+	local sunit = unit and unit or "target";
+	local parts = {};
+	for i=1, 19 do
+		parts[i] = GetInventoryItemLink(sunit, i) or "-";
+	end
+	return table.concat(parts, ";");
+end
+
+local function _CopyTable(t)
+	local r = {};
+	for k,v in pairs(t) do r[k] = v; end
+	return r;
+end
+
 function StatScanner_ScanUnit(unit)
 	--[[
 	0 = ammo
@@ -356,10 +389,30 @@ function StatScanner_ScanUnit(unit)
 	local id, hasItem;
 	local itemName, tmpText, tmpStr, tmpSet, lines, set;
 
+	local sig = StatScanner_GetGearSignature(sunit);
+	if (sunit == "target") then
+		sig = (UnitName("target") or "?") .. "|" .. sig;
+	end
+	local cached = StatScanner_GearCache[sunit];
+	if (cached and cached.sig == sig) then
+		-- Copy bonuses: buff/char scanners add into this table afterwards.
+		StatScanner_bonuses = _CopyTable(cached.bonuses);
+		StatScanner_sets = _CopyTable(cached.sets);
+		StatScanner_setcount = cached.setcount;
+		StatScanner_setsproperty = cached.setsproperty;
+		StatScanner_currentset = "";
+		StatScanner_currentsetcount = "";
+		return;
+	end
+
 	StatScanner_bonuses = {};
 	StatScanner_sets = {};
 	StatScanner_setcount = {};
 	StatScanner_setsproperty = {};
+
+	-- An item whose link is not available yet (inspect data still loading) makes
+	-- the result incomplete, so we don't cache it.
+	local incomplete = false;
 
 	for i=1, 19 ,1 do
 		StatScanner_currentset = "";
@@ -376,6 +429,9 @@ function StatScanner_ScanUnit(unit)
 		end
 		itemName = SCObjectTooltipTextLeft1:GetText();
 		lines = SCObjectTooltip:NumLines();
+		if (link == nil and lines > 0 and itemName) then
+			incomplete = true;
+		end
 
 		for j=2, lines, 1 do
 			tmpText = getglobal("SCObjectTooltipTextLeft"..j);
@@ -392,4 +448,16 @@ function StatScanner_ScanUnit(unit)
 	end
 
 	SCObjectTooltip:Hide()
+
+	if (not incomplete) then
+		StatScanner_GearCache[sunit] = {
+			sig = sig,
+			bonuses = _CopyTable(StatScanner_bonuses),
+			sets = _CopyTable(StatScanner_sets),
+			setcount = StatScanner_setcount,
+			setsproperty = StatScanner_setsproperty,
+		};
+	else
+		StatScanner_GearCache[sunit] = nil;
+	end
 end

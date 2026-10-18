@@ -444,6 +444,50 @@ function StatCompare_OnEvent()
 		StatCompare_isLoaded=1;
 	end
 	if ( (event == "UNIT_INVENTORY_CHANGED") and StatCompare_enable and StatCompare_isLoaded==1) then
+		-- PERF: this event fires in bursts (gear-set swaps, durability, ammo...).
+		-- Coalesce it and only refresh once things settle, and only if gear really changed.
+		if (arg1 == "player" or arg1 == "target") then
+			StatCompare_QueueInventoryRefresh(arg1);
+		end
+	elseif ( event == "PLAYER_LOGOUT" ) then
+		-- save the player settings
+		StatCompare_SaveConfigInfo();
+	end
+end
+
+local SC_PendingRefresh = {};
+local SC_RefreshTimer = 0;
+local SC_RefreshFrame = CreateFrame("Frame");
+SC_RefreshFrame:Hide();
+SC_RefreshFrame:SetScript("OnUpdate", function()
+	SC_RefreshTimer = SC_RefreshTimer - arg1;
+	if (SC_RefreshTimer > 0) then return; end
+	this:Hide();
+	for unit in pairs(SC_PendingRefresh) do
+		SC_PendingRefresh[unit] = nil;
+		StatCompare_DoInventoryRefresh(unit);
+	end
+end);
+
+function StatCompare_QueueInventoryRefresh(unit)
+	SC_PendingRefresh[unit] = true;
+	SC_RefreshTimer = 0.25;
+	SC_RefreshFrame:Show();
+end
+
+function StatCompare_DoInventoryRefresh(unit)
+	if (not StatCompare_enable or StatCompare_isLoaded ~= 1) then return; end
+	-- Gear unchanged (durability tick, ammo...) -> nothing to redraw.
+	local cached = StatScanner_GearCache and StatScanner_GearCache[unit];
+	if (cached) then
+		local sig = StatScanner_GetGearSignature(unit);
+		if (unit == "target") then
+			sig = (UnitName("target") or "?") .. "|" .. sig;
+		end
+		if (cached.sig == sig) then return; end
+	end
+	local arg1 = unit;
+	do
 		if ((arg1 == "player") and StatCompareSelfFrame:IsVisible()) then
 			SCHideFrame(StatCompareSelfFrame);
 			local tiptext = StatCompare_UpdateAndGetTooltipText(StatScanner_bonuses,1);
@@ -460,9 +504,6 @@ function StatCompare_OnEvent()
 			tiptext = StatCompare_UpdateAndGetTooltipText(StatScanner_bonuses,1);
 			SCShowFrame(StatCompareSelfFrame,StatCompareTargetFrame,UnitName("player"),tiptext,0,0);
 		end
-	elseif ( event == "PLAYER_LOGOUT" ) then
-		-- save the player settings
-		StatCompare_SaveConfigInfo();
 	end
 end
 
