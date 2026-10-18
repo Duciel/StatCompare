@@ -53,27 +53,47 @@ function SC_BuffScanner_ScanAllInspect( bonus, unit )
 	return nil;
 end
 
+-- PERF: buff tooltip lines repeat constantly, so remember which pattern (if any)
+-- matched a given line and its captures instead of re-running every pattern.
+local SC_BuffLineCache = {};
+local SC_BuffLineCacheSize = 0;
+
 function SC_BuffScanner_ScanLine(line)
-	local i, p, value, start;
-	local found = false;
+	local i, p, value, start, v1, v2, v3, v4;
 
-	line = string.gsub( line, "^%s+", "" );
-	for i,p in pairs(STATCOMPARE_BUFF_PATTERNS) do
-		start, _, value, v1, v2, v3, v4 = string.find(line, "^" .. p.pattern);
-
-		if(start) then
-			if(p.king) then
-				SC_Buffer_King = 1;
-			elseif(p.value) then
-				SC_BuffScanner_AddValue(p.effect, p.value);
-			elseif(value) then
-				SC_BuffScanner_AddValue(p.effect, value, v1, v2, v3, v4);
+	local hit = SC_BuffLineCache[line];
+	if (hit == nil) then
+		local trimmed = string.gsub( line, "^%s+", "" );
+		hit = false;
+		for i,p in pairs(STATCOMPARE_BUFF_PATTERNS) do
+			if (not p.apattern) then p.apattern = "^" .. p.pattern; end
+			start, _, value, v1, v2, v3, v4 = string.find(trimmed, p.apattern);
+			if(start) then
+				hit = { p = p, value = value, v1 = v1, v2 = v2, v3 = v3, v4 = v4 };
+				break;
 			end
-			found = true;
-			break;
 		end
+		if (SC_BuffLineCacheSize > 500) then
+			SC_BuffLineCache = {};
+			SC_BuffLineCacheSize = 0;
+		end
+		SC_BuffLineCache[line] = hit;
+		SC_BuffLineCacheSize = SC_BuffLineCacheSize + 1;
 	end
-	return found;
+
+	if (not hit) then
+		return false;
+	end
+
+	p = hit.p;
+	if(p.king) then
+		SC_Buffer_King = 1;
+	elseif(p.value) then
+		SC_BuffScanner_AddValue(p.effect, p.value);
+	elseif(hit.value) then
+		SC_BuffScanner_AddValue(p.effect, hit.value, hit.v1, hit.v2, hit.v3, hit.v4);
+	end
+	return true;
 end;
 
 function SC_BuffScanner_AddValue(effect, value, v1, v2, v3, v4)
